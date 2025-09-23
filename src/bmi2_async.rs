@@ -201,9 +201,127 @@ where
         Ok(len)
     }
 
-    pub async fn get_fifo_data(&mut self) -> Result<(), Error<CommE>> {
-        // TODO Fifo is 6KB, will need the max read info from user + fifo config
-        Ok(())
+    pub async fn get_fifo_data(
+        &mut self,
+        acc_out: &mut [AxisData],
+        gyr_out: &mut [AxisData],
+        last_sensortime: &mut Option<u32>,
+    ) -> Result<(usize, usize), Error<CommE>> {
+        if self.max_burst as usize > N {
+            return Err(Error::<CommE>::BufferTooSmall);
+        }
+        let max_data_per_read = core::cmp::min(self.max_burst as usize, N).saturating_sub(1);
+        if max_data_per_read == 0 {
+            return Err(Error::<CommE>::BufferTooSmall);
+        }
+
+        const AUX_BLOCK_LEN: usize = 8; // typical AUX payload size in header mode
+
+        let mut acc_written = 0usize;
+        let mut gyr_written = 0usize;
+
+        'outer: loop {
+            let remaining = self.get_fifo_len().await? as usize;
+            if remaining == 0 {
+                break;
+            }
+            let to_read = core::cmp::min(remaining, max_data_per_read);
+
+            let mut scratch = alloc_stack!([u8; N]);
+            let mut vec = FixedVec::new(&mut scratch);
+            vec.clear();
+            vec.push(Registers::FIFO_DATA).map_err(|_| Error::Alloc)?;
+            for _ in 0..to_read {
+                vec.push(0u8).map_err(|_| Error::Alloc)?;
+            }
+            self.iface.read(vec.as_mut_slice()).await?;
+
+            let mut i = 1;
+            while i < vec.len() {
+                let hdr = vec[i];
+                i += 1;
+
+                let mode = hdr & 0xC0;
+                let is_regular = mode == 0x80;
+                let is_control = mode == 0x40;
+
+                if !is_regular && !is_control {
+                    break;
+                }
+
+                if is_regular {
+                    let fh_ext = (hdr & 0x08) != 0;
+
+                    let (acc_en, gyr_en, aux_en) = if fh_ext {
+                        if i >= vec.len() { break 'outer; }
+                        let hdr2 = vec[i]; i += 1;
+                        ((hdr2 & 0x01) != 0, (hdr2 & 0x02) != 0, (hdr2 & 0x04) != 0)
+                    } else {
+                        ((hdr & 0x01) != 0, (hdr & 0x02) != 0, (hdr & 0x04) != 0)
+                    };
+
+                    // BMI270 regular frame payload order: ACC -> GYR -> AUX
+                    if acc_en {
+                        if i + 6 > vec.len() { break 'outer; }
+                        if acc_written < acc_out.len() {
+                            let x = (vec[i] as i16) | ((vec[i + 1] as i16) << 8);
+                            let y = (vec[i + 2] as i16) | ((vec[i + 3] as i16) << 8);
+                            let z = (vec[i + 4] as i16) | ((vec[i + 5] as i16) << 8);
+                            acc_out[acc_written] = AxisData { x, y, z };
+                            acc_written += 1;
+                        }
+                        i += 6;
+                    }
+
+                    if gyr_en {
+                        if i + 6 > vec.len() { break 'outer; }
+                        if gyr_written < gyr_out.len() {
+                            let x = (vec[i] as i16) | ((vec[i + 1] as i16) << 8);
+                            let y = (vec[i + 2] as i16) | ((vec[i + 3] as i16) << 8);
+                            let z = (vec[i + 4] as i16) | ((vec[i + 5] as i16) << 8);
+                            gyr_out[gyr_written] = AxisData { x, y, z };
+                            gyr_written += 1;
+                        }
+                        i += 6;
+                    }
+
+                    if aux_en {
+                        if i + AUX_BLOCK_LEN > vec.len() { break 'outer; }
+                        i += AUX_BLOCK_LEN;
+                    }
+
+                    continue;
+                }
+
+                let parm = hdr & 0x0F;
+                match parm {
+                    0x0 => {
+                        if i + 1 > vec.len() { break 'outer; }
+                        let _ = vec[i];
+                        i += 1;
+                    }
+                    0x1 => {
+                        if i + 3 > vec.len() { break 'outer; }
+                        let st = (vec[i] as u32)
+                            | ((vec[i + 1] as u32) << 8)
+                            | ((vec[i + 2] as u32) << 16);
+                        *last_sensortime = Some(st);
+                        i += 3;
+                    }
+                    0x2 => {
+                        if i + 4 > vec.len() { break 'outer; }
+                        i += 4;
+                    }
+                    _ => {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let _ = self.get_int_status();
+
+        Ok((acc_written, gyr_written))
     }
 
     /// Get the accelerometer configuration.
